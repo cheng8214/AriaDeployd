@@ -1,0 +1,5 @@
+.lenocache/
+dist/
+deployd.json
+logs/
+*.lenb

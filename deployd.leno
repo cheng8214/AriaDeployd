@@ -1,0 +1,419 @@
+// ============================================================================
+//  deployd — 跑在**目标机器**上的部署守护进程（LenoHTTP，单文件 exe）
+// ----------------------------------------------------------------------------
+//  为什么要有它：目标机只有 3389/445，没有 SSH / WinRM ⇒ 没法远程执行命令。
+//  这里起一个内网 HTTP 小服务，让工具（或 curl）能：
+//    · 上传文件到指定目录（被占用就先把占用进程杀掉再写）
+//    · 停止 / 启动指定的 exe（后台运行，stdout 重定向到日志）
+//    · 查看进程状态、拉日志尾
+//
+//  鉴权：除 /health 外都要 `X-Token`（配置里的 token）✓
+//  白名单：只能操作 config.roots 下的路径（防误删整个盘 ✗）
+//
+//  启动：deployd.exe  （端口/token 读 deployd.json，也可用环境变量覆盖）
+//         DEPLOYD_PORT=8899  DEPLOYD_TOKEN=xxx
+// ============================================================================
+import "HTTP" as http
+import Sys
+import files
+import dirs
+import times
+import jsons
+import strings
+
+const string VERSION = "1.0.0"
+const string CFG_NAME = "deployd.json"
+
+var _cfgPort = 8899
+var _cfgToken = ""
+Array[string] _roots = []
+var _cfgLoaded = false
+var _startSec = 0
+
+// ==================== 配置 ====================
+// deployd.json（与 exe 同目录）：
+//   { "port": 8899, "token": "xxx", "roots": ["C:\\aria-server"] }
+func _cfg_path(): string {
+    return dirs.join(_str(dirs.script_dir()), CFG_NAME)
+}
+
+func _load_cfg() {
+    if _cfgLoaded { return }
+    _cfgLoaded = true
+    string p = _cfg_path()
+    if not files.exists(p) {
+        string tk = "tk" + _str(_int(times.ms()))
+        string tpl = "{\n"
+                   + "  \"port\": 8899,\n"
+                   + "  \"token\": \"" + tk + "\",\n"
+                   + "  \"roots\": [\"C:\\\\aria-server\"]\n"
+                   + "}\n"
+        try { files.write(p, tpl) } catch e { print("[cfg] 写模板失败：" + _str(e)) }
+        print("[cfg] 已生成模板 " + p)
+        print("[cfg] token = " + tk)
+        _cfgToken = tk
+        return
+    }
+    try {
+        var d = jsons.decode(files.read(p))
+        var dd = d as Dict
+        if dd == null { return }
+        _cfgPort = _int(_str(dd.get("port", "8899")))
+        _cfgToken = _str(dd.get("token", ""))
+        var rs = dd.get("roots") as Array
+        if rs != null {
+            for rs to one { _roots.add(_str(one)) }
+        }
+    } catch e {
+        print("[cfg] 解析失败：" + _str(e))
+    }
+}
+
+// 路径是否在白名单内（Windows 大小写不敏感）
+func _allowed(string p): bool {
+    if p == "" { return false }
+    string lp = p.to_lower().replace("/", "\\")
+    for _roots to r {
+        string lr = r.to_lower().replace("/", "\\").trim()
+        if lr == "" { continue }
+        if lp == lr { return true }
+        string pref = lr
+        string lastCh = lr.slice(lr.len() - 1, lr.len() - 1)
+        if lastCh != "\\" { pref = lr + "\\" }
+        if lp.byte_find(pref) == 0 { return true }
+    }
+    return false
+}
+
+func _q(Dict req): Dict {
+    var q = req.get("query")
+    var d = q as Dict
+    if d == null { return {} }
+    return d
+}
+
+func _qstr(Dict req, string k): string {
+    var d = _q(req)
+    return _str(d.get(k, ""))
+}
+
+// 参数取值：**优先 header**（`X-To` / `X-Name` / `X-Args`），其次 query
+//   为什么要 header：Windows 路径含 `\` 和 `:`，塞进 query 必须 URL 编码，
+//   curl 直接把 `C:\x\y.exe` 拼进去会被截断（实测：上传后远端 0 字节 ✗）✓
+func _arg(Dict req, string k): string {
+    var hs = req.get("headers") as Dict
+    if hs != null {
+        string h = _str(hs.get("x-" + k, ""))
+        if h == "" { h = _str(hs.get("X-" + k, "")) }
+        if h != "" { return h }
+    }
+    return _qstr(req, k)
+}
+
+// 同名 exe 的进程（排除自己）
+//   ⚠ `Sys.findProcess` 是**子串**匹配（`server.exe` 会匹配到 `dumate-main-server.exe`、
+//     `wetype_server.exe`）⇒ 必须按进程名**完全相等**再过滤一遍，否则 stop 会误杀别人的进程 ✗
+//   ⚠⚠ 为什么用 tasklist/taskkill 而不是 `Sys.findProcess` / `killProcess`：
+//     HTTP handler 跑在 **worker 线程**，而 Win32 进程枚举用的是主线程初始化的库句柄，
+//     worker 里调用会抛「库对象已释放」——第一次可能成功、之后整个线程被打断
+//     （实测：先 status 正常，再上传就 500，后面全 500 ✗）。
+//     `Sys.exec` 走 CreateProcessW，在 worker 里是好的（启动服务一直成功 ✓），所以统一走它。
+//
+//   返回 [[pid, name, memKb], ...]
+func _procs(string name): Array[Array[string]] {
+    Array[Array[string]] out = []
+    if name == "" { return out }
+    var r = Sys.exec("tasklist /FI \"IMAGENAME eq " + name + "\" /FO CSV /NH", 8000)
+    string txt = _str(r.get("out", ""))
+    var lines = txt.split("\n")
+    string target = name.to_lower()
+    for lines to ln {
+        string l = ln.trim()
+        if l == "" or l.byte_find("\"") != 0 { continue }     // 只认 CSV 行（"server.exe","1234",…）
+        var cols = l.split(",")
+        if cols.len() < 2 { continue }
+        string nm = _str(cols[0]).replace("\"", "").trim()
+        if nm.to_lower() != target { continue }               // 精确匹配，防误杀 ✗
+        string pidS = _str(cols[1]).replace("\"", "").trim()
+        string memS = if cols.len() >= 5 then _str(cols[4]).replace("\"", "").replace(",", "").replace("K", "").trim() else "0"
+        out.add([pidS, nm, memS])
+    }
+    return out
+}
+
+func _kill_all(string name): int {
+    if name == "" { return 0 }
+    // 先数一下有几个，再杀（taskkill 的返回码只说成败，没数量）
+    int before = _procs(name).len()
+    if before == 0 { return 0 }
+    var r = Sys.exec("taskkill /F /IM " + name, 8000)
+    int after = _procs(name).len()
+    int k = before - after
+    if k < 0 { k = 0 }
+    return k
+}
+
+func _dir_of(string p): string {
+    int i = p.len() - 1
+    while i >= 0 {
+        string ch = p.slice(i, i)
+        if ch == "\\" or ch == "/" { return p.slice(0, i - 1) }
+        i = i - 1
+    }
+    return "."
+}
+
+func _file_name(string p): string {
+    int i = p.len() - 1
+    while i >= 0 {
+        string ch = p.slice(i, i)
+        if ch == "\\" or ch == "/" { return p.slice(i + 1, p.len() - 1) }
+        i = i - 1
+    }
+    return p
+}
+
+// 后台启动（立即返回）：stdout/stderr 追加到 log
+func _start(string exe, string args, string log): bool {
+    if not files.exists(exe) { return false }
+    try { dirs.mkdir_p(_dir_of(log)) } catch e { print("[warn] " + _str(e)) }
+    string inner = "\"" + exe + "\""
+    if args != "" { inner = inner + " " + args }
+    inner = inner + " >> \"" + log + "\" 2>&1"
+    string cmd = "cmd /c start \"\" /b cmd /c " + inner
+    var r = Sys.exec(cmd, 8000)
+    return _str(r.get("ok", "false")) == "true"
+}
+
+// ==================== 接口 ====================
+
+func api_health(Dict req): Dict {
+    return http.json({ok: true, service: "deployd", version: VERSION,
+                      uptime: _int(times.now()) - _startSec, os: Sys.os()})
+}
+
+// GET /status?name=server.exe
+func api_status(Dict req): Dict {
+    string name = _arg(req, "name")
+    if name == "" { return http.status(400, "missing ?name=") }
+    var ps = _procs(name)
+    Array[Dict] out = []
+    for ps to p {
+        out.add({pid: _int(p[0]), name: p[1], memKb: _int(p[2])})
+    }
+    return http.json({ok: true, running: out.len() > 0, count: out.len(), procs: out})
+}
+
+// POST /stop?name=server.exe
+func api_stop(Dict req): Dict {
+    string name = _arg(req, "name")
+    if name == "" { return http.status(400, "missing ?name=") }
+    int n = _kill_all(name)
+    return http.json({ok: true, killed: n})
+}
+
+// POST /start?exe=<绝对路径>[&args=...]
+func api_start(Dict req): Dict {
+    string exe = _arg(req, "exe")
+    string args = _arg(req, "args")
+    if exe == "" { return http.status(400, "missing ?exe=") }
+    if not _allowed(exe) { return http.status(403, "path not allowed") }
+    string log = dirs.join(dirs.join(_dir_of(exe), "logs"),
+                           _file_name(exe) + "." + times.format(times.now(), "%Y%m%d") + ".log")
+    bool ok = _start(exe, args, log)
+    return http.json({ok: ok, log: log})
+}
+
+// POST /upload?to=<绝对路径>[&name=进程名][&args=...]
+//   body = 文件原始字节；目标被占用 ⇒ 自动杀掉占用者再写（用户要求 ✓）
+//   带 `name` 时：写完顺带启动（= 部署并重启）
+func api_upload(Dict req): Dict {
+    string dest = _arg(req, "to")
+    if dest == "" { return http.status(400, "missing ?to=") }
+    if not _allowed(dest) { return http.status(403, "path not allowed") }
+    string body = _str(req.get("body", ""))
+    int sz = body.byte_len()
+    if sz <= 0 { return http.status(400, "empty body") }
+    try { dirs.mkdir_p(_dir_of(dest)) } catch e { print("[warn] " + _str(e)) }
+
+    string name = _arg(req, "name")
+    string args = _arg(req, "args")
+    // chunked: with part -> write to <dest>.partN, then /merge joins them
+    string partS = _arg(req, "part")
+    bool hasPart = partS != ""
+    string target = if hasPart then dest + ".part" + partS else dest
+    bool wasRun = false
+    int killed = 0
+    if name != "" {
+        wasRun = _procs(name).len() > 0
+        killed = _kill_all(name)
+    }
+
+    // 备份旧文件（exe 才值得备份）
+    bool backuped = false
+    if files.exists(dest) {
+        try {
+            files.write(dest + ".bak", files.read(dest))
+            backuped = true
+        } catch e { print("[upload] 备份失败：" + _str(e)) }
+    }
+
+    // 写：失败当"被占用"，按文件名再杀一次后重试
+    bool okW = false
+    string errW = ""
+    try {
+        files.write(target, body)
+        okW = true
+    } catch e1 {
+        errW = _str(e1)
+        int k2 = _kill_all(_file_name(dest))
+        if k2 > 0 {
+            killed = killed + k2
+            try {
+                files.write(target, body)
+                okW = true
+            } catch e2 {
+                errW = _str(e2)
+            }
+        }
+    }
+    if not okW {
+        return http.status(500, "写入失败：" + errW)
+    }
+
+    int onDisk = 0
+    try { onDisk = files.read(target).byte_len() } catch e { print("[warn] " + _str(e)) }
+    bool sizeOk = onDisk == sz
+
+    // 原来是运行状态（或显式给了 name）⇒ 重新拉起
+    bool started = false
+    if name != "" and (wasRun or args != "") {
+        string log = dirs.join(dirs.join(_dir_of(dest), "logs"),
+                               name + "." + times.format(times.now(), "%Y%m%d") + ".log")
+        started = _start(dest, args, log)
+    }
+    // ⚠ `to` 是保留字，字典键必须写成字符串形式
+    return http.json({ok: true, size: sz, onDisk: onDisk, sizeOk: sizeOk,
+                      "to": dest, killed: killed, backuped: backuped, started: started})
+}
+
+// GET /logs?file=<绝对路径>&n=100
+func api_merge(Dict req): Dict {
+    string dest = _arg(req, "to")
+    int n = _int(_arg(req, "n"))
+    if dest == "" or n <= 0 { return http.status(400, "missing to/n") }
+    if not _allowed(dest) { return http.status(403, "path not allowed") }
+    string all = ""
+    for 0 : n - 1 to i {
+        string pf = dest + ".part" + _str(i)
+        if not files.exists(pf) { return http.status(400, "missing part " + _str(i)) }
+        all = all + files.read(pf)
+    }
+    files.write(dest, all)
+    int cleaned = 0
+    for 0 : n - 1 to i {
+        string pf2 = dest + ".part" + _str(i)
+        try {
+            if files.exists(pf2) {
+                files.delete(pf2)
+                cleaned = cleaned + 1
+            }
+        } catch e { print("[warn] " + _str(e)) }
+    }
+    return http.json({ok: true, size: all.byte_len(), cleaned: cleaned})
+}
+
+func api_logs(Dict req): Dict {
+    string f = _arg(req, "file")
+    int n = _int(_qstr(req, "n"))
+    if n <= 0 { n = 80 }
+    if n > 500 { n = 500 }
+    if f == "" { return http.status(400, "missing ?file=") }
+    if not _allowed(f) { return http.status(403, "path not allowed") }
+    if not files.exists(f) { return http.json({ok: true, exists: false, lines: []}) }
+    string txt = ""
+    try { txt = files.read(f) } catch e { return http.status(500, "read failed") }
+    var all = txt.split("\n")
+    Array[string] out = []
+    int i = all.len() - 1
+    while i >= 0 and out.len() < n {
+        out.add(_str(all[i]))
+        i = i - 1
+    }
+    Array[string] rev = []
+    int j = out.len() - 1
+    while j >= 0 {
+        rev.add(out[j])
+        j = j - 1
+    }
+    return http.json({ok: true, exists: true, lines: rev})
+}
+
+// ==================== 入口 ====================
+func _guard(Dict req): Dict {
+    string path = _str(req.get("path", ""))
+    if path == "/health" { return null }
+    var hs = req.get("headers") as Dict
+    string t = ""
+    if hs != null {
+        t = _str(hs.get("x-token", ""))
+        if t == "" { t = _str(hs.get("X-Token", "")) }
+    }
+    if _cfgToken == "" or t != _cfgToken {
+        return http.status(401, "bad token")
+    }
+    return null
+}
+
+// 路由表里的 handler 是闭包 ⇒ **必须在真正使用它的线程里建**（与 Aria 服务端同款 ✓）
+// worker 线程入口：必须是具名模块函数、arity 恰好 2
+//   ⚠ 框架修复（2026-11-07）：`w32_process` / `sqlite3_core` 的 clib 缓存已改成
+//     `threads.local_*`，多线程下不会再出现「库对象已释放」。这里继续用线程池 ✓
+func workerMain(int idx, Channel conns): int {
+    return http.workerLoop(build_app(), conns)
+}
+
+func build_app(): Dict {
+    var app = http.newApp()
+    http.before(app, _guard)
+    http.routes(app, [
+        {method: "GET",  path: "/health", handler: api_health},
+        {method: "GET",  path: "/status", handler: api_status},
+        {method: "POST", path: "/stop",   handler: api_stop},
+        {method: "POST", path: "/start",  handler: api_start},
+        {method: "POST", path: "/upload", handler: api_upload, maxBody: 4194304},
+        {method: "POST", path: "/merge",  handler: api_merge},
+        {method: "GET",  path: "/logs",   handler: api_logs}
+    ])
+    return app
+}
+
+// ★ 为什么**不用**多线程池（serveWorkers）：
+//   handler 在 worker 线程里跑，而 `Sys.exec` / `Sys.findProcess` / `Sys.killProcess`
+//   依赖主线程初始化的 Win32 库句柄 ⇒ worker 里会抛「库对象已释放」，
+//   第一次碰巧成功、之后整个线程被打断（实测：先 status 正常，上传就 500，后面全 500 ✗）。
+//   deployd 只服务一个人（部署工具）⇒ 单线程阻塞式 `http.serve` 完全够，且 handler 在主线程，
+//   所有 Sys API 都能用 ✓
+
+main() {
+    _startSec = _int(times.now())
+    _load_cfg()
+    int port = _cfgPort
+    string e1 = Sys.env("DEPLOYD_PORT", "")
+    if e1 != "" { port = _int(e1) }
+    string e2 = Sys.env("DEPLOYD_TOKEN", "")
+    if e2 != "" { _cfgToken = e2 }
+
+    print("deployd v" + VERSION)
+    print("  配置：" + _cfg_path())
+    print("  token：" + (if _cfgToken == "" then "(空 ⇒ 全部 401)" else "已设置"))
+    for _roots to r2 { print("  白名单：" + r2) }
+
+    var app = build_app()
+    var arr = app["routes"] as Array
+    print("  路由：" + _str(arr.len()) + " 条（期望 7）")
+    print("  监听 http://0.0.0.0:" + _str(port))
+
+    var r = http.serveWorkers(app, "0.0.0.0", port, 2, workerMain)
+    print("  退出：" + _str(r.get("ok", "")) + " " + _str(r.get("err", "")))
+}
