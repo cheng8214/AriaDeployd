@@ -76,7 +76,11 @@ func _load_cfg() {
 //   而 `/status` 不用 `_roots` 所以一直正常 —— 用户看到的就是「终止了但起不来」。
 //   ⇒ 配置改放 `threads.local_*`：每个线程首次用到时自己从文件读一份，各归各的 GC ✓
 func _parse_cfg(): Dict {
-    Dict out = {"port": "8899", "token": "", "roots": []}
+    // ⚠ 白名单用 **`|` 拼接的字符串**存，不用 Array：
+    //   `dd.get("roots") as Array` 在这版运行时里会拿到 null（JSON 数组的类型参数不同）
+    //   ⇒ roots 恒为空 ⇒ 所有带路径的接口都回 `path not allowed`（实测两轮 ✗）。
+    //   字符串一定能取到，split 一下就还原 ✓
+    Dict out = {"port": "8899", "token": "", "roots": ""}
     string p = _cfg_path()
     if not files.exists(p) { return out }
     try {
@@ -85,12 +89,21 @@ func _parse_cfg(): Dict {
         if dd == null { return out }
         out.set("port", _str(dd.get("port", "8899")))
         out.set("token", _str(dd.get("token", "")))
-        Array[string] rs = []
-        var ra = dd.get("roots") as Array
+        string joined = ""
+        var ra = dd.get("roots")
         if ra != null {
-            for ra to one { rs.add(_str(one)) }
+            var arr = ra as Array
+            if arr != null {
+                for arr to one {
+                    string s = _str(one).trim()
+                    if s == "" { continue }
+                    joined = joined + (if joined == "" then "" else "|") + s
+                }
+            } else {
+                print("[cfg] roots 不是数组，忽略")
+            }
         }
-        out.set("roots", rs)
+        out.set("roots", joined)
     } catch e {
         print("[cfg] parse failed: " + _str(e))
     }
@@ -111,9 +124,10 @@ func _cfg(): Dict {
 func _allowed(string p): bool {
     if p == "" { return false }
     string lp = p.to_lower().replace("/", "\\")
-    var roots = _cfg().get("roots") as Array
-    if roots == null { return false }
-    for roots to one {
+    string joined = _str(_cfg().get("roots", ""))
+    if joined == "" { return false }
+    var pieces = joined.split("|")
+    for pieces to one {
         string lr = _str(one).to_lower().replace("/", "\\").trim()
         if lr == "" { continue }
         if lp == lr { return true }
