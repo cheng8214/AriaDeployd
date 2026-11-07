@@ -202,7 +202,13 @@ func _kill_all(string name): int {
     // 先数一下有几个，再杀（taskkill 的返回码只说成败，没数量）
     int before = _procs(name).len()
     if before == 0 { return 0 }
-    var r = Sys.exec("taskkill /F /IM " + name, 8000)
+    Sys.exec("taskkill /F /IM " + name, 8000)
+    // taskkill 返回时进程可能还在收尾（句柄没释放）⇒ 原地轮询最多约 1 秒
+    //   （原来立刻再数一次，经常读到「还在」⇒ killed 报 0，看着像没杀成功 ✗）
+    for 0 : 10 to i {
+        if _procs(name).len() == 0 { break }
+        Sys.exec("cmd /c ping -n 1 -w 100 127.0.0.1 >nul", 3000)
+    }
     int after = _procs(name).len()
     int k = before - after
     if k < 0 { k = 0 }
@@ -242,6 +248,28 @@ func _start(string exe, string args, string log): bool {
 }
 
 // ==================== 接口 ====================
+
+// GET /config → 当前配置（白名单 / token / 端口）
+//   ★ 2026-11-07 用户要求：部署方要先知道**白名单是哪个目录**，否则会往白名单外的路径写、
+//     每次都被 403 挡回来（实测：我按 C:\aria-server 试了半天，实际白名单是 D:\AriaServer ✗）
+func api_config(Dict req): Dict {
+    Dict c = _cfg()
+    // roots 内部存成 "a|b"，这里拆回数组返回（好读）
+    Array[string] rs = []
+    string joined = _str(c.get("roots", ""))
+    if joined != "" {
+        var pieces = joined.split("|")
+        for pieces to one {
+            string s = _str(one).trim()
+            if s != "" { rs.add(s) }
+        }
+    }
+    return http.json({ok: true, version: VERSION,
+                      port: _str(c.get("port", "")),
+                      token: _str(c.get("token", "")),
+                      roots: rs,
+                      cfgPath: _cfg_path()})
+}
 
 func api_health(Dict req): Dict {
     return http.json({ok: true, service: "deployd", version: VERSION,
@@ -359,6 +387,11 @@ func api_merge(Dict req): Dict {
     int n = _int(_arg(req, "n"))
     if dest == "" or n <= 0 { return http.status(400, "missing to/n") }
     if not _allowed(dest) { return http.status(403, "path not allowed") }
+    // ★ 2026-11-07：带 `name` 就先停同名进程 —— merge 要覆盖的目标往往正在运行，
+    //   不先停会直接 500「无法创建文件」（实测踩了两次，客户端脚本因此必须自己先 stop）
+    int killed = 0
+    string nm = _arg(req, "name")
+    if nm != "" { killed = _kill_all(nm) }
     string all = ""
     for 0 : n - 1 to i {
         string pf = dest + ".part" + _str(i)
@@ -376,7 +409,7 @@ func api_merge(Dict req): Dict {
             }
         } catch e { print("[warn] " + _str(e)) }
     }
-    return http.json({ok: true, size: all.byte_len(), cleaned: cleaned})
+    return http.json({ok: true, size: all.byte_len(), cleaned: cleaned, killed: killed})
 }
 
 func api_logs(Dict req): Dict {
@@ -436,6 +469,7 @@ func build_app(): Dict {
     http.before(app, _guard)
     http.routes(app, [
         {method: "GET",  path: "/health", handler: api_health},
+        {method: "GET",  path: "/config", handler: api_config},
         {method: "GET",  path: "/status", handler: api_status},
         {method: "POST", path: "/stop",   handler: api_stop},
         {method: "POST", path: "/start",  handler: api_start},
@@ -471,7 +505,7 @@ main() {
 
     var app = build_app()
     var arr = app["routes"] as Array
-    print("  路由：" + _str(arr.len()) + " 条（期望 7）")
+    print("  路由：" + _str(arr.len()) + " 条（期望 8）")
     print("  监听 http://0.0.0.0:" + _str(port))
 
     var r = http.serveWorkers(app, "0.0.0.0", port, 2, workerMain)

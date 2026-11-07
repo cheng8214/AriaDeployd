@@ -89,7 +89,7 @@ for ($i = 0; $i -lt $total; $i++) {
 Remove-Item $seg -Force -ErrorAction SilentlyContinue
 
 Write-Host '[3/5] merge chunks' -ForegroundColor Cyan
-$m = curl.exe -s -m 40 -X POST -H ('X-Token: ' + $Token) -H ('X-To: ' + $Dest) -H ('X-N: ' + [string]$total) ($base + '/merge')
+$m = curl.exe -s -m 40 -X POST -H ('X-Token: ' + $Token) -H ('X-To: ' + $Dest) -H ('X-N: ' + [string]$total) -H ('X-Name: ' + $Name) ($base + '/merge')
 Write-Host ('  ' + $m) -ForegroundColor DarkGray
 if ($m -notmatch ('"size":' + $bytes.Length)) {
     Write-Host '  merged size mismatch, abort' -ForegroundColor Red
