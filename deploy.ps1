@@ -2,7 +2,7 @@
   deploy.ps1 — 把 exe 推到目标机器并重启（配合 deployd.leno 用）
 
   用法：
-    .\deploy.ps1 -Host 192.168.1.150 -Dest C:\aria-server\server.exe -Exe d:\CLeno\Aria\server\dist\server.exe
+    .\deploy.ps1 -TargetHost 192.168.1.150 -Dest C:\aria-server\server.exe -Exe d:\CLeno\Aria\server\dist\server.exe
     .\deploy.ps1 ... -Name server.exe -Args "5767 0.0.0.0 4"      # 部署后自动启动
     .\deploy.ps1 ... -OnlyStop                                    # 只停
     .\deploy.ps1 ... -Status                                      # 只看状态
@@ -11,7 +11,7 @@
   流程：分块上传（每块 900KB）→ /merge 合并 → 停止旧进程 → 启动 → 健康检查
 #>
 param(
-    [string]$Host = '192.168.1.150',
+    [string]$TargetHost = '192.168.1.150',
     [int]$Port = 8899,
     [string]$Token = 'test123',
     [string]$Dest = '',
@@ -27,7 +27,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$base = "http://${Host}:${Port}"
+$base = "http://${TargetHost}:${Port}"
 $H = @{ 'X-Token' = $Token }
 
 function Post($path, [hashtable]$extra) {
@@ -35,7 +35,7 @@ function Post($path, [hashtable]$extra) {
     foreach ($k in $H.Keys) { $h[$k] = $H[$k] }
     foreach ($k in $extra.Keys) { $h[$k] = $extra[$k] }
     $argsList = @('-s', '-m', '120', '-X', 'POST')
-    foreach ($k in $h.Keys) { $argsList += @('-H', "$k`: $($h[$k])") }
+    foreach ($k in $h.Keys) { $argsList += @('-H', ($k + ': ' + [string]$h[$k])) }
     $argsList += @($base + $path)
     return (curl.exe @argsList)
 }
@@ -45,7 +45,7 @@ function Get2($path, [hashtable]$extra) {
     foreach ($k in $H.Keys) { $h[$k] = $H[$k] }
     foreach ($k in $extra.Keys) { $h[$k] = $extra[$k] }
     $argsList = @('-s', '-m', '30')
-    foreach ($k in $h.Keys) { $argsList += @('-H', "$k`: $($h[$k])") }
+    foreach ($k in $h.Keys) { $argsList += @('-H', ($k + ': ' + [string]$h[$k])) }
     $argsList += @($base + $path)
     return (curl.exe @argsList)
 }

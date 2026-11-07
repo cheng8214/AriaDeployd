@@ -406,7 +406,9 @@ main() {
 
     print("deployd v" + VERSION)
     print("  配置：" + _cfg_path())
-    print("  token：" + (if _cfgToken == "" then "(空 ⇒ 全部 401)" else "已设置"))
+    // 直接打印 token：内网工具、日志只在目标机本地，写清楚省得部署方到处找
+    //   （2026-11-07 实测：只打印「已设置」时，部署方拿不到 token，来回问了两轮）
+    print("  token：" + (if _cfgToken == "" then "(空 ⇒ 全部 401)" else _cfgToken))
     for _roots to r2 { print("  白名单：" + r2) }
 
     var app = build_app()
