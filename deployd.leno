@@ -246,7 +246,11 @@ func _start(string exe, string args, string log): bool {
     //   进程完全静默，出问题只能翻日志 ✗
     //   现在去掉 /b（弹控制台窗口）、不再重定向（窗口里直接看输出）
     //   ⇒ 关掉那个窗口就等于停服务，排查时更直观 ✓
-    string cmd = "cmd /c start \"\" cmd /c " + inner
+    // ★ 2026-11-07：必须用 /d 指定**工作目录** = 目标 exe 所在目录
+    //   start 默认让子进程继承 deployd 的当前目录（D:\deployd）⇒ 服务端按相对路径
+    //   找不到 data / admin.json 就挂 —— 表现为「进程活着但不监听任何端口」（实测 ✗）
+    string workDir = _dir_of(exe)
+    string cmd = "cmd /c start \"\" /d \"" + workDir + "\" cmd /c " + inner
     var r = Sys.exec(cmd, 8000)
     return _str(r.get("ok", "false")) == "true"
 }
