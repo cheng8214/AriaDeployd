@@ -241,8 +241,12 @@ func _start(string exe, string args, string log): bool {
     try { dirs.mkdir_p(_dir_of(log)) } catch e { print("[warn] " + _str(e)) }
     string inner = "\"" + exe + "\""
     if args != "" { inner = inner + " " + args }
-    inner = inner + " >> \"" + log + "\" 2>&1"
-    string cmd = "cmd /c start \"\" /b cmd /c " + inner
+    // ★ 2026-11-07 用户反馈「启动后没有控制台，看不到输出」：
+    //   原来 `start "" /b` + `>> log 2>&1` —— /b 不新建窗口、输出又全进文件，
+    //   进程完全静默，出问题只能翻日志 ✗
+    //   现在去掉 /b（弹控制台窗口）、不再重定向（窗口里直接看输出）
+    //   ⇒ 关掉那个窗口就等于停服务，排查时更直观 ✓
+    string cmd = "cmd /c start \"\" cmd /c " + inner
     var r = Sys.exec(cmd, 8000)
     return _str(r.get("ok", "false")) == "true"
 }
