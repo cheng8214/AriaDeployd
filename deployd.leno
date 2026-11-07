@@ -20,6 +20,7 @@ import dirs
 import times
 import jsons
 import strings
+import threads
 
 const string VERSION = "1.0.0"
 const string CFG_NAME = "deployd.json"
@@ -69,12 +70,51 @@ func _load_cfg() {
     }
 }
 
+// ★ 2026-11-07 实测事故：模块级 `Array[string] _roots` 是**进程级共享**的，而 GC 是
+//   **线程级**的 ⇒ worker 线程的 sweep 会把它当垃圾回收（C 层修复只保住了 OBJ_FFI_LIBRARY）。
+//   现象：服务跑一阵之后 `/start` `/upload` `/logs` 全返回 `path not allowed`（因为 `_roots` 空了），
+//   而 `/status` 不用 `_roots` 所以一直正常 —— 用户看到的就是「终止了但起不来」。
+//   ⇒ 配置改放 `threads.local_*`：每个线程首次用到时自己从文件读一份，各归各的 GC ✓
+func _parse_cfg(): Dict {
+    Dict out = {"port": "8899", "token": "", "roots": []}
+    string p = _cfg_path()
+    if not files.exists(p) { return out }
+    try {
+        var d = jsons.decode(files.read(p))
+        var dd = d as Dict
+        if dd == null { return out }
+        out.set("port", _str(dd.get("port", "8899")))
+        out.set("token", _str(dd.get("token", "")))
+        Array[string] rs = []
+        var ra = dd.get("roots") as Array
+        if ra != null {
+            for ra to one { rs.add(_str(one)) }
+        }
+        out.set("roots", rs)
+    } catch e {
+        print("[cfg] parse failed: " + _str(e))
+    }
+    return out
+}
+
+// 当前线程的配置（首次调用读一次文件，之后走线程局部缓存）
+func _cfg(): Dict {
+    var t = threads.local_get("deployd.cfg", null)
+    var d = t as Dict
+    if d != null { return d }
+    Dict c = _parse_cfg()
+    threads.local_set("deployd.cfg", c)
+    return c
+}
+
 // 路径是否在白名单内（Windows 大小写不敏感）
 func _allowed(string p): bool {
     if p == "" { return false }
     string lp = p.to_lower().replace("/", "\\")
-    for _roots to r {
-        string lr = r.to_lower().replace("/", "\\").trim()
+    var roots = _cfg().get("roots") as Array
+    if roots == null { return false }
+    for roots to one {
+        string lr = _str(one).to_lower().replace("/", "\\").trim()
         if lr == "" { continue }
         if lp == lr { return true }
         string pref = lr
@@ -130,12 +170,14 @@ func _procs(string name): Array[Array[string]] {
     for lines to ln {
         string l = ln.trim()
         if l == "" or l.byte_find("\"") != 0 { continue }     // 只认 CSV 行（"server.exe","1234",…）
-        var cols = l.split(",")
-        if cols.len() < 2 { continue }
+        // ⚠ 按 `","` 切，不能按 `,` —— 内存列是 `"11,632 K"`（带千分位逗号），
+        //   按逗号切会把一列劈成两列：cols[4] 变成 `"11` ⇒ 状态里 memKb 显示成 11（实测 ✗）
+        var cols = l.split("\",\"")
+        if cols.len() < 5 { continue }
         string nm = _str(cols[0]).replace("\"", "").trim()
         if nm.to_lower() != target { continue }               // 精确匹配，防误杀 ✗
         string pidS = _str(cols[1]).replace("\"", "").trim()
-        string memS = if cols.len() >= 5 then _str(cols[4]).replace("\"", "").replace(",", "").replace("K", "").trim() else "0"
+        string memS = _str(cols[4]).replace("\"", "").replace(",", "").replace("K", "").trim()
         out.add([pidS, nm, memS])
     }
     return out
@@ -359,7 +401,9 @@ func _guard(Dict req): Dict {
         t = _str(hs.get("x-token", ""))
         if t == "" { t = _str(hs.get("X-Token", "")) }
     }
-    if _cfgToken == "" or t != _cfgToken {
+    // 用线程局部配置里的 token（模块级 `_cfgToken` 同样会被 worker 的 GC 回收 ✗）
+    string expect = _str(_cfg().get("token", ""))
+    if expect == "" or t != expect {
         return http.status(401, "bad token")
     }
     return null
