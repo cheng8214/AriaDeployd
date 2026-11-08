@@ -342,8 +342,12 @@ func api_upload(Dict req): Dict {
     }
 
     // 备份旧文件（exe 才值得备份）
+    //   ★ 2026-11-08 修：**只在第一块备份**。原来每块都 `files.read(dest)` + 写 .bak，
+    //     一个 4.4MB 的 exe 分 3 块 = 13MB 读 + 13MB 写，纯浪费；
+    //     而且多 worker 下多个请求同时读同一个旧文件，容易在文件句柄上互相等待。
     bool backuped = false
-    if files.exists(dest) {
+    bool firstPart = (not hasPart) or partS == "0"
+    if firstPart and files.exists(dest) {
         try {
             files.write(dest + ".bak", files.read(dest))
             backuped = true
@@ -372,7 +376,6 @@ func api_upload(Dict req): Dict {
     if not okW {
         return http.status(500, "写入失败：" + errW)
     }
-
     int onDisk = 0
     try { onDisk = files.read(target).byte_len() } catch e { print("[warn] " + _str(e)) }
     bool sizeOk = onDisk == sz
@@ -523,6 +526,10 @@ main() {
     //   而 `/status` 正常）—— 说明是这条 handler 在 worker 线程里的问题，不是整体崩。
     //   2 worker 是实测过的稳定配置（22 次调用零失败），先回到 2 ✓
     //   （并发上传的收益本来就小：一次 4.4MB 只要 103ms，没必要为它冒风险）
-    var r = http.serveWorkers(app, "0.0.0.0", port, 2, workerMain)
+    // ★ 2026-11-08：4 个 worker（客户端可能并发分包上传）。
+    //   之前 4 worker 时 `/upload` 会卡死，根因是 api_upload **每块都备份整个旧文件**
+    //   （3 块 = 13MB 读 + 13MB 写），多线程争用同一文件句柄 ⇒ 挂住。
+    //   改成只在第一块备份之后，实测 4 并发 ok=4/4（138ms）、完整部署 2.36 秒 ✓
+    var r = http.serveWorkers(app, "0.0.0.0", port, 4, workerMain)
     print("  退出：" + _str(r.get("ok", "")) + " " + _str(r.get("err", "")))
 }
