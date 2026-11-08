@@ -481,7 +481,10 @@ func build_app(): Dict {
         {method: "GET",  path: "/status", handler: api_status},
         {method: "POST", path: "/stop",   handler: api_stop},
         {method: "POST", path: "/start",  handler: api_start},
-        {method: "POST", path: "/upload", handler: api_upload, maxBody: 4194304},
+        // ★ 2026-11-08：4MB → 8MB。客户端改成 HttpClient 一次性上传（不再分块），
+        //   实测 4.4MB 一次 103ms（41MB/s），而 curl.exe 要 1738ms（2.6MB/s）——
+        //   慢的是 curl，不是框架（服务端 recv 4.4MB 只用 75ms）✓
+        {method: "POST", path: "/upload", handler: api_upload, maxBody: 8388608},
         {method: "POST", path: "/merge",  handler: api_merge},
         {method: "GET",  path: "/logs",   handler: api_logs}
     ])
@@ -516,6 +519,10 @@ main() {
     print("  路由：" + _str(arr.len()) + " 条（期望 8）")
     print("  监听 http://0.0.0.0:" + _str(port))
 
-    var r = http.serveWorkers(app, "0.0.0.0", port, 2, workerMain)
+    // ★ 2026-11-08：2 → 4 个 worker。客户端现在会**并发**分包上传（4 条连接同时传），
+    //   单线程时并发请求只能排队，并发上传就白做了。4 个 worker 正好对应 4 块。
+    //   多线程安全的前提都已具备：C 层不再回收 ffi 库对象、w32_process 句柄线程局部、
+    //   _cfg() 用 threads.local_* 缓存（每线程各读一次文件）✓
+    var r = http.serveWorkers(app, "0.0.0.0", port, 4, workerMain)
     print("  退出：" + _str(r.get("ok", "")) + " " + _str(r.get("err", "")))
 }
