@@ -519,10 +519,10 @@ main() {
     print("  路由：" + _str(arr.len()) + " 条（期望 8）")
     print("  监听 http://0.0.0.0:" + _str(port))
 
-    // ★ 2026-11-08：2 → 4 个 worker。客户端现在会**并发**分包上传（4 条连接同时传），
-    //   单线程时并发请求只能排队，并发上传就白做了。4 个 worker 正好对应 4 块。
-    //   多线程安全的前提都已具备：C 层不再回收 ffi 库对象、w32_process 句柄线程局部、
-    //   _cfg() 用 threads.local_* 缓存（每线程各读一次文件）✓
-    var r = http.serveWorkers(app, "0.0.0.0", port, 4, workerMain)
+    // ⚠ 2026-11-08 回退：4 worker 时 `/upload` 会卡死（curl 传 512KB 也 10 秒超时，
+    //   而 `/status` 正常）—— 说明是这条 handler 在 worker 线程里的问题，不是整体崩。
+    //   2 worker 是实测过的稳定配置（22 次调用零失败），先回到 2 ✓
+    //   （并发上传的收益本来就小：一次 4.4MB 只要 103ms，没必要为它冒风险）
+    var r = http.serveWorkers(app, "0.0.0.0", port, 2, workerMain)
     print("  退出：" + _str(r.get("ok", "")) + " " + _str(r.get("err", "")))
 }
