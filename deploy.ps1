@@ -83,7 +83,9 @@ Write-Host ('[2/5] upload ' + $bytes.Length + ' bytes in ' + $total + ' chunk(s)
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 $handler = New-Object System.Net.Http.HttpClientHandler
 $client = New-Object System.Net.Http.HttpClient($handler)
-$client.Timeout = [TimeSpan]::FromSeconds(180)
+# ⚠ 超时别设太大：服务端在 `Content-Length > MAX_BODY` 时**直接断连、不回响应**，
+#   客户端会一直等到超时（设 180 秒就卡三分钟，实测被卡过 ✗）。30 秒足够传几十 MB。
+$client.Timeout = [TimeSpan]::FromSeconds(30)
 
 $swUp = [Diagnostics.Stopwatch]::StartNew()
 for ($i = 0; $i -lt $total; $i++) {
