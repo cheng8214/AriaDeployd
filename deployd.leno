@@ -376,8 +376,13 @@ func api_upload(Dict req): Dict {
     if not okW {
         return http.status(500, "写入失败：" + errW)
     }
+    // ★ 2026-11-09：用 files.size() 取落盘大小，**不再 files.read() 整块读回来量**。
+    //   原来每块写完都 `files.read(target).byte_len()` —— 4.4MB 分 3 块就要多读 4.4MB，
+    //   分块越多浪费越线性增长（和之前"每块都备份整个旧文件"是同一类问题：
+    //   分块上传里的任何全量操作都会乘以块数）✗
+    //   files.size 是本次顺带给框架补的能力（stat/GetFileAttributesEx，不读内容）。
     int onDisk = 0
-    try { onDisk = files.read(target).byte_len() } catch e { print("[warn] " + _str(e)) }
+    try { onDisk = files.size(target) } catch e { print("[warn] " + _str(e)) }
     bool sizeOk = onDisk == sz
 
     // 原来是运行状态（或显式给了 name）⇒ 重新拉起
