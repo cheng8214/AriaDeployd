@@ -241,17 +241,24 @@ func _start(string exe, string args, string log): bool {
     try { dirs.mkdir_p(_dir_of(log)) } catch e { print("[warn] " + _str(e)) }
     string inner = "\"" + exe + "\""
     if args != "" { inner = inner + " " + args }
-    // ★ 2026-11-07 用户反馈「启动后没有控制台，看不到输出」：
-    //   原来 `start "" /b` + `>> log 2>&1` —— /b 不新建窗口、输出又全进文件，
-    //   进程完全静默，出问题只能翻日志 ✗
-    //   现在去掉 /b（弹控制台窗口）、不再重定向（窗口里直接看输出）
-    //   ⇒ 关掉那个窗口就等于停服务，排查时更直观 ✓
+    // ★ 2026-11-13 修「部署脚本卡死几十分钟」：
+    //   2026-11-07 为了"启动后能看到控制台输出"，把 `>> log 2>&1` 去掉了 ——
+    //   结果子进程**继承了 deployd 的 stdout 管道**：`Sys.exec` 要读到管道 EOF 才返回，
+    //   而服务是常驻进程、永不关 stdout ⇒ handler 直接不返回。
+    //   deployd 又是单线程 `http.serve` ⇒ 这一卡，/status /logs /start 全部跟着卡死，
+    //   deploy.ps1 在 [5/5] 每轮 curl 都等超时（实测：卡了几十分钟，线上服务其实早就起来了 ✗）。
+    //   现在把 stdout/stderr 重定向进 log 文件：孙进程的 stdout 指向文件、不继承管道
+    //   ⇒ Sys.exec 立刻返回 ✓；窗口没了，但日志走 `/logs` 接口照样能看 ✓
     // ★ 2026-11-07：必须用 /d 指定**工作目录** = 目标 exe 所在目录
     //   start 默认让子进程继承 deployd 的当前目录（D:\deployd）⇒ 服务端按相对路径
     //   找不到 data / admin.json 就挂 —— 表现为「进程活着但不监听任何端口」（实测 ✗）
     string workDir = _dir_of(exe)
-    string cmd = "cmd /c start \"\" /d \"" + workDir + "\" cmd /c " + inner
-    var r = Sys.exec(cmd, 8000)
+    // ★ 2026-11-13：`/b` 必须加 —— 不加的话 `start` 会**新建一个控制台窗口**，
+    //   子进程的 stdout 是那个新控制台（CONOUT$），**不会继承**命令里的 `>> log` 重定向
+    //   ⇒ 日志文件建出来是 0 字节（实测：`/logs` 读回 exists:true 但 lines 全空 ✗）。
+    //   加 /b = 不开窗口、继承当前重定向 ⇒ 输出真的进日志文件 ✓
+    string cmd = "cmd /c start \"\" /b /d \"" + workDir + "\" cmd /c " + inner + " >> \"" + log + "\" 2>&1"
+    var r = Sys.exec(cmd, 5000)
     return _str(r.get("ok", "false")) == "true"
 }
 
