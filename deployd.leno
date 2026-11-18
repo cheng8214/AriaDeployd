@@ -462,7 +462,7 @@ func api_logs(Dict req): Dict {
 }
 
 // ==================== 入口 ====================
-func _guard(Dict req): Dict {
+func _guard(Dict req): Dict? {
     string path = _str(req.get("path", ""))
     if path == "/health" { return null }
     var hs = req.get("headers") as Dict
